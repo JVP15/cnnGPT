@@ -1,3 +1,11 @@
+# What I Added
+
+I'm using this repo to do quick tests for architectural changes to GPT-style models. I've mainly done two experiments:
+1. replace linear layer before attention w/ CNNs. It has fewer params but worse GPU util than linear layer. 
+Also does worse on val loss for tinyshakesphere.
+
+2. since the input and output weights are tied, why don't we do a cosine similarity loss b/w the final hidden state and the embedding for the true token? 
+This does worse in terms of validation loss, but interestingly, you *can* get the model to somewhat coherent text with this cosine loss on hidden states instead of the cross entropy loss.
 
 # nanoGPT
 
