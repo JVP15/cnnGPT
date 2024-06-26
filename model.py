@@ -11,9 +11,36 @@ import math
 import inspect
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+
+
+def create_double_conv(in_channels, out_channels):
+    return nn.Sequential(
+        nn.ZeroPad2d((1, 1, 2, 0)),
+        nn.Conv2d(in_channels, out_channels, 3),
+        nn.ReLU(inplace=True),
+        nn.ZeroPad2d((1, 1, 2, 0)),
+        nn.Conv2d(out_channels, out_channels, 3, stride=(1, 2)),
+    )
+
+def create_projection(n_head):
+    proj = []
+
+    for i in range(int(np.log2(n_head))):
+        proj.append(
+            create_double_conv(1 if i == 0 else n_head, n_head)
+        )
+        if i != int(np.log2(n_head)) - 1:
+            proj.append(nn.ReLU(inplace=True))
+
+    return nn.Sequential(*proj)
+
+
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -33,6 +60,13 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+
+        # sequential nn of cnns that converts a tensor of shape (B, 1, T, C) to (B, nh, T, hs)
+        self.k_cnn_proj = create_projection(config.n_head)
+        self.q_cnn_proj = create_projection(config.n_head)
+        self.v_cnn_proj = create_projection(config.n_head) # on duuuuh, the convs take information from later in the sequence and pass it to earlier in the sequence...
+
+
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
@@ -49,6 +83,19 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
+    def qkv_proj(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # unsqueeze to add a head dimension
+        x = x.unsqueeze(1) # (B, T, C) -> (B, 1, T, C)
+
+        k = self.k_cnn_proj(x) # (B, 1, T, C) -> (B, nh, T, hs)
+        q = self.q_cnn_proj(x) # (B, 1, T, C) -> (B, nh, T, hs)
+        v = self.v_cnn_proj(x) # (B, 1, T, C) -> (B, nh, T, hs)
+
+        return q, k, v
+
+
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
@@ -57,6 +104,8 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        #q, k, v = self.qkv_proj(x)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -114,6 +163,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    loss_fn: str = 'cosine' # 'crossentropy', 'cosine', or 'mse'
 
 class GPT(nn.Module):
 
@@ -136,6 +186,16 @@ class GPT(nn.Module):
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+        # ADDED BY JVP: playing around w/ different loss functions
+        if config.loss_fn == 'cosine':
+            self.loss_fn = nn.CosineEmbeddingLoss()
+        elif config.loss_fn == 'mse':
+            self.loss_fn = nn.MSELoss()
+        else:
+            self.loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
+
+        self.ones = nn.Parameter(torch.tensor(1), requires_grad=False)  # for cosine similarity, we need to pass 1 as a target so that it tries to maximize similarity (-1 would try to minimize)
 
         # init all weights
         self.apply(self._init_weights)
@@ -182,9 +242,30 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            if self.config.loss_fn == 'cosine' or self.config.loss_fn == 'mse':
+                # need to un-pad the target sequence and flatten it (b/c cosine doesn't do padded tensors)
+                mask = (targets != -1)
+                targets = torch.masked_select(targets, mask)
+
+                with torch.no_grad():
+                    targets_embeddings = self.transformer.wte(targets)
+
+                # now we have to flatten the x tensor in much the same way
+                mask = mask.unsqueeze(-1).expand_as(x)
+                x_flat = torch.masked_select(x, mask).view(-1, self.config.n_embd)
+
+                params = [x_flat, targets_embeddings]
+                if self.config.loss_fn == 'cosine':
+                    params.append(self.ones.expand(targets.shape[0]))
+
+                loss = self.loss_fn(*params)
+
+                with torch.no_grad():
+                    logits = self.lm_head(x)
+            else:
+                # if we are given some desired targets also calculate the loss
+                logits = self.lm_head(x)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim

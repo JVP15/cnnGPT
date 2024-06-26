@@ -54,6 +54,7 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+loss_fn = 'cosine'
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -134,6 +135,12 @@ def get_batch(split):
 iter_num = 0
 best_val_loss = 1e9
 
+init_from = 'resume'
+learning_rate = 3e-5
+min_lr = 3e-6
+loss_fn = 'crossentropy'
+max_iters=6000
+
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
 meta_vocab_size = None
@@ -145,7 +152,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, loss_fn=loss_fn) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -218,12 +225,18 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        losses_crossentropy = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
+
+                crossentropy_loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1), ignore_index=-1)
+                losses_crossentropy[k] = crossentropy_loss.item()
+
             losses[k] = loss.item()
         out[split] = losses.mean()
+        out[split+'_crossentropy'] = losses_crossentropy.mean()
     model.train()
     return out
 
@@ -267,7 +280,9 @@ while True:
             wandb.log({
                 "iter": iter_num,
                 "train/loss": losses['train'],
+                "train/crossentropy": losses['train_crossentropy'],
                 "val/loss": losses['val'],
+                "val/crossentropy": losses['val_crossentropy'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
